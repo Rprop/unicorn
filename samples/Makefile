@@ -5,11 +5,6 @@ include ../config.mk
 
 UNAME_S := $(shell uname -s)
 
-# Find GLIB
-ifndef GLIB
-GLIB = $(shell pkg-config --libs glib-2.0)
-endif
-
 LIBDIR = ..
 BIN_EXT =
 AR_EXT = a
@@ -18,8 +13,13 @@ AR_EXT = a
 V ?= 0
 
 CFLAGS += -Wall -Werror -I../include
-LDFLAGS += -L$(LIBDIR) -lunicorn -lpthread -lm $(GLIB)
-LDLIBS += -lpthread -lunicorn -lm $(GLIB)
+
+LDFLAGS += -L$(LIBDIR) -lunicorn -lpthread -lm
+ifeq ($(UNAME_S), Linux)
+LDFLAGS += -lrt
+endif
+
+LDLIBS += -lpthread -lunicorn -lm
 
 ifneq ($(CROSS),)
 CC = $(CROSS)gcc
@@ -64,9 +64,11 @@ UNICORN_ARCHS := $(shell if [ -e ../config.log ]; then cat ../config.log;\
 SOURCES =
 ifneq (,$(findstring arm,$(UNICORN_ARCHS)))
 SOURCES += sample_arm.c
+SOURCES += sample_armeb.c
 endif
 ifneq (,$(findstring aarch64,$(UNICORN_ARCHS)))
 SOURCES += sample_arm64.c
+SOURCES += sample_arm64eb.c
 endif
 ifneq (,$(findstring mips,$(UNICORN_ARCHS)))
 SOURCES += sample_mips.c

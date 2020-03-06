@@ -1,5 +1,11 @@
 CFLAGS += -Wall -Werror -I../../include
-LDLIBS += -L../../ $(shell pkg-config --libs glib-2.0) -lpthread -lm -lunicorn
+CFLAGS += -D__USE_MINGW_ANSI_STDIO=1
+LDLIBS += -L../../ -lm -lunicorn
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S), Linux)
+LDLIBS += -lrt -pthread
+endif
 
 EXECUTE_VARS = LD_LIBRARY_PATH=../../cmocka/src:../../ DYLD_LIBRARY_PATH=../../
 

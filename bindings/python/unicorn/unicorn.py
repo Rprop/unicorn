@@ -7,8 +7,9 @@ import pkg_resources
 import inspect
 import os.path
 import sys
+import weakref
 
-from . import x86_const, unicorn_const as uc
+from . import x86_const, arm64_const, unicorn_const as uc
 
 if not hasattr(sys.modules[__name__], "__file__"):
     __file__ = inspect.getfile(inspect.currentframe())
@@ -29,10 +30,6 @@ _all_windows_dlls = (
     "libwinpthread-1.dll",
     "libgcc_s_seh-1.dll",
     "libgcc_s_dw2-1.dll",
-    "libiconv-2.dll",
-    "libpcre-1.dll",
-    "libintl-8.dll",
-    "libglib-2.0-0.dll",
 )
 
 _loaded_windows_dlls = set()
@@ -85,7 +82,7 @@ _path_list = [pkg_resources.resource_filename(__name__, 'lib'),
               '',
               distutils.sysconfig.get_python_lib(),
               "/usr/local/lib/" if sys.platform == 'darwin' else '/usr/lib64',
-              os.environ['PATH']]
+              os.getenv('PATH', '')]
 
 #print(_path_list)
 #print("-" * 80)
@@ -108,6 +105,14 @@ uc_engine = ctypes.c_void_p
 uc_context = ctypes.c_void_p
 uc_hook_h = ctypes.c_size_t
 
+class _uc_mem_region(ctypes.Structure):
+    _fields_ = [
+        ("begin", ctypes.c_uint64),
+        ("end",   ctypes.c_uint64),
+        ("perms", ctypes.c_uint32),
+    ]
+
+
 _setup_prototype(_uc, "uc_version", ctypes.c_uint, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
 _setup_prototype(_uc, "uc_arch_supported", ctypes.c_bool, ctypes.c_int)
 _setup_prototype(_uc, "uc_open", ucerr, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(uc_engine))
@@ -127,9 +132,10 @@ _setup_prototype(_uc, "uc_mem_unmap", ucerr, uc_engine, ctypes.c_uint64, ctypes.
 _setup_prototype(_uc, "uc_mem_protect", ucerr, uc_engine, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_uint32)
 _setup_prototype(_uc, "uc_query", ucerr, uc_engine, ctypes.c_uint32, ctypes.POINTER(ctypes.c_size_t))
 _setup_prototype(_uc, "uc_context_alloc", ucerr, uc_engine, ctypes.POINTER(uc_context))
-_setup_prototype(_uc, "uc_context_free", ucerr, uc_context)
+_setup_prototype(_uc, "uc_free", ucerr, ctypes.c_void_p)
 _setup_prototype(_uc, "uc_context_save", ucerr, uc_engine, uc_context)
 _setup_prototype(_uc, "uc_context_restore", ucerr, uc_engine, uc_context)
+_setup_prototype(_uc, "uc_mem_regions", ucerr, uc_engine, ctypes.POINTER(ctypes.POINTER(_uc_mem_region)), ctypes.POINTER(ctypes.c_uint32))
 
 # uc_hook_add is special due to variable number of arguments
 _uc.uc_hook_add = _uc.uc_hook_add
@@ -196,6 +202,11 @@ class uc_x86_mmr(ctypes.Structure):
         ("flags", ctypes.c_uint32),     # not used by GDTR and IDTR
     ]
 
+class uc_x86_msr(ctypes.Structure):
+    _fields_ = [
+        ("rid", ctypes.c_uint32),
+        ("value", ctypes.c_uint64),
+    ]
 
 class uc_x86_float80(ctypes.Structure):
     """Float80"""
@@ -212,8 +223,58 @@ class uc_x86_xmm(ctypes.Structure):
         ("high_qword", ctypes.c_uint64),
     ]
 
+class uc_x86_ymm(ctypes.Structure):
+    """256-bit ymm register"""
+    _fields_ = [
+        ("first_qword", ctypes.c_uint64),
+        ("second_qword", ctypes.c_uint64),
+        ("third_qword", ctypes.c_uint64),
+        ("fourth_qword", ctypes.c_uint64),
+    ]
+
+class uc_arm64_neon128(ctypes.Structure):
+    """128-bit neon register"""
+    _fields_ = [
+        ("low_qword", ctypes.c_uint64),
+        ("high_qword", ctypes.c_uint64),
+    ]
+
+# Subclassing ref to allow property assignment.
+class UcRef(weakref.ref):
+    pass
+
+# This class tracks Uc instance destruction and releases handles.
+class UcCleanupManager(object):
+    def __init__(self):
+        self._refs = {}
+
+    def register(self, uc):
+        ref = UcRef(uc, self._finalizer)
+        ref._uch = uc._uch
+        ref._class = uc.__class__
+        self._refs[id(ref)] = ref
+
+    def _finalizer(self, ref):
+        # note: this method must be completely self-contained and cannot have any references
+        # to anything else in this module.
+        #
+        # This is because it may be called late in the Python interpreter's shutdown phase, at
+        # which point the module's variables may already have been deinitialized and set to None.
+        #
+        # Not respecting that can lead to errors such as:
+        #     Exception AttributeError:
+        #       "'NoneType' object has no attribute 'release_handle'"
+        #       in <bound method UcCleanupManager._finalizer of
+        #       <unicorn.unicorn.UcCleanupManager object at 0x7f0bb83e4310>> ignored
+        #
+        # For that reason, we do not try to access the `Uc` class directly here but instead use
+        # the saved `._class` reference.
+        del self._refs[id(ref)]
+        ref._class.release_handle(ref._uch)
 
 class Uc(object):
+    _cleanup = UcCleanupManager()
+
     def __init__(self, arch, mode):
         # verify version compatibility with the core before doing anything
         (major, minor, _combined) = uc_version()
@@ -232,13 +293,13 @@ class Uc(object):
         self._callbacks = {}
         self._ctype_cbs = {}
         self._callback_count = 0
+        self._cleanup.register(self)
 
-    # destructor to be called automatically when object is destroyed.
-    def __del__(self):
-        if self._uch:
+    @staticmethod
+    def release_handle(uch):
+        if uch:
             try:
-                status = _uc.uc_close(self._uch)
-                self._uch = None
+                status = _uc.uc_close(uch)
                 if status != uc.UC_ERR_OK:
                     raise UcError(status)
             except:  # _uc might be pulled from under our feet
@@ -257,7 +318,7 @@ class Uc(object):
             raise UcError(status)
 
     # return the value of a register
-    def reg_read(self, reg_id):
+    def reg_read(self, reg_id, opt=None):
         if self._arch == uc.UC_ARCH_X86:
             if reg_id in [x86_const.UC_X86_REG_IDTR, x86_const.UC_X86_REG_GDTR, x86_const.UC_X86_REG_LDTR, x86_const.UC_X86_REG_TR]:
                 reg = uc_x86_mmr()
@@ -273,6 +334,29 @@ class Uc(object):
                 return reg.mantissa, reg.exponent
             if reg_id in range(x86_const.UC_X86_REG_XMM0, x86_const.UC_X86_REG_XMM0+8):
                 reg = uc_x86_xmm()
+                status = _uc.uc_reg_read(self._uch, reg_id, ctypes.byref(reg))
+                if status != uc.UC_ERR_OK:
+                    raise UcError(status)
+                return reg.low_qword | (reg.high_qword << 64)
+            if reg_id in range(x86_const.UC_X86_REG_YMM0, x86_const.UC_X86_REG_YMM0+8):
+                reg = uc_x86_ymm()
+                status = _uc.uc_reg_read(self._uch, reg_id, ctypes.byref(reg))
+                if status != uc.UC_ERR_OK:
+                    raise UcError(status)
+                return reg.first_qword | (reg.second_qword << 64) | (reg.third_qword << 128) | (reg.fourth_qword << 192)
+            if reg_id is x86_const.UC_X86_REG_MSR:
+                if opt is None:
+                    raise UcError(uc.UC_ERR_ARG)
+                reg = uc_x86_msr()
+                reg.rid = opt
+                status = _uc.uc_reg_read(self._uch, reg_id, ctypes.byref(reg))
+                if status != uc.UC_ERR_OK:
+                    raise UcError(status)
+                return reg.value
+
+        if self._arch == uc.UC_ARCH_ARM64:
+            if reg_id in range(arm64_const.UC_ARM64_REG_Q0, arm64_const.UC_ARM64_REG_Q31+1) or range(arm64_const.UC_ARM64_REG_V0, arm64_const.UC_ARM64_REG_V31+1):
+                reg = uc_arm64_neon128()
                 status = _uc.uc_reg_read(self._uch, reg_id, ctypes.byref(reg))
                 if status != uc.UC_ERR_OK:
                     raise UcError(status)
@@ -305,6 +389,22 @@ class Uc(object):
                 reg = uc_x86_xmm()
                 reg.low_qword = value & 0xffffffffffffffff
                 reg.high_qword = value >> 64
+            if reg_id in range(x86_const.UC_X86_REG_YMM0, x86_const.UC_X86_REG_YMM0+8):
+                reg = uc_x86_ymm()
+                reg.first_qword = value & 0xffffffffffffffff
+                reg.second_qword = (value >> 64) & 0xffffffffffffffff
+                reg.third_qword = (value >> 128) & 0xffffffffffffffff
+                reg.fourth_qword = value >> 192
+            if reg_id is x86_const.UC_X86_REG_MSR:
+                reg = uc_x86_msr()
+                reg.rid = value[0]
+                reg.value = value[1]
+
+        if self._arch == uc.UC_ARCH_ARM64:
+            if reg_id in range(arm64_const.UC_ARM64_REG_Q0, arm64_const.UC_ARM64_REG_Q31+1) or range(arm64_const.UC_ARM64_REG_V0, arm64_const.UC_ARM64_REG_V31+1):
+                reg = uc_arm64_neon128()
+                reg.low_qword = value & 0xffffffffffffffff
+                reg.high_qword = value >> 64
 
         if reg is None:
             # convert to 64bit number to be safe
@@ -313,6 +413,14 @@ class Uc(object):
         status = _uc.uc_reg_write(self._uch, reg_id, ctypes.byref(reg))
         if status != uc.UC_ERR_OK:
             raise UcError(status)
+
+    # read from MSR - X86 only
+    def msr_read(self, msr_id):
+        return self.reg_read(x86_const.UC_X86_REG_MSR, msr_id)
+
+    # write to MSR - X86 only
+    def msr_write(self, msr_id, value):
+        return self.reg_write(x86_const.UC_X86_REG_MSR, (msr_id, value))
 
     # read data from memory
     def mem_read(self, address, size):
@@ -492,12 +600,27 @@ class Uc(object):
         if status != uc.UC_ERR_OK:
             raise UcError(status)
 
+    # this returns a generator of regions in the form (begin, end, perms)
+    def mem_regions(self):
+        regions = ctypes.POINTER(_uc_mem_region)()
+        count = ctypes.c_uint32()
+        status = _uc.uc_mem_regions(self._uch, ctypes.byref(regions), ctypes.byref(count))
+        if status != uc.UC_ERR_OK:
+            raise UcError(status)
+
+        try:
+            for i in range(count.value):
+                yield (regions[i].begin, regions[i].end, regions[i].perms)
+        finally:
+            _uc.uc_free(regions)
+
+
 class SavedContext(object):
     def __init__(self, pointer):
         self.pointer = pointer
 
     def __del__(self):
-        status = _uc.uc_context_free(self.pointer)
+        status = _uc.uc_free(self.pointer)
         if status != uc.UC_ERR_OK:
             raise UcError(status)
 
